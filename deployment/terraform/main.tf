@@ -109,6 +109,58 @@ resource "aws_dynamodb_table" "budget_performance" {
   }
 }
 
+resource "aws_dynamodb_table" "image_registry" {
+  name         = "rising_image_registry"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "image_id"
+
+  attribute {
+    name = "image_id"
+    type = "S"
+  }
+
+  tags = {
+    Project     = "rising-pmax"
+    Environment = var.environment
+  }
+}
+
+# ---------- S3 Bucket ----------
+
+resource "aws_s3_bucket" "pmax_images" {
+  bucket = "rising-pmax"
+
+  tags = {
+    Project     = "rising-pmax"
+    Environment = var.environment
+  }
+}
+
+resource "aws_s3_bucket_versioning" "pmax_images" {
+  bucket = aws_s3_bucket.pmax_images.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "pmax_images" {
+  bucket = aws_s3_bucket.pmax_images.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "pmax_images" {
+  bucket = aws_s3_bucket.pmax_images.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
 # ---------- IAM Role ----------
 
 data "aws_iam_policy_document" "lambda_assume_role" {
@@ -146,6 +198,20 @@ data "aws_iam_policy_document" "lambda_policy" {
       "${aws_dynamodb_table.asset_performance.arn}/index/*",
       aws_dynamodb_table.asset_graveyard.arn,
       aws_dynamodb_table.budget_performance.arn,
+      aws_dynamodb_table.image_registry.arn,
+    ]
+  }
+
+  # S3 access for image assets
+  statement {
+    actions = [
+      "s3:GetObject",
+      "s3:PutObject",
+      "s3:ListBucket",
+    ]
+    resources = [
+      aws_s3_bucket.pmax_images.arn,
+      "${aws_s3_bucket.pmax_images.arn}/*",
     ]
   }
 
@@ -253,6 +319,32 @@ resource "aws_lambda_function" "verify_upload" {
   }
 }
 
+resource "aws_lambda_function" "image_ops" {
+  filename         = "${path.module}/../../packages/image_ops.zip"
+  function_name    = "rising-image-ops"
+  role             = aws_iam_role.lambda_role.arn
+  handler          = "lambda_functions.image_ops.lambda_handler"
+  runtime          = "python3.12"
+  timeout          = 300
+  memory_size      = 1024
+  source_code_hash = filebase64sha256("${path.module}/../../packages/image_ops.zip")
+
+  layers = [aws_lambda_layer_version.dependencies.arn]
+
+  environment {
+    variables = {
+      ENVIRONMENT   = var.environment
+      DEPLOY_REGION = var.aws_region
+      S3_IMAGE_BUCKET = aws_s3_bucket.pmax_images.id
+    }
+  }
+
+  tags = {
+    Project     = "rising-pmax"
+    Environment = var.environment
+  }
+}
+
 # ---------- EventBridge Schedules ----------
 
 resource "aws_cloudwatch_event_rule" "weekly_review" {
@@ -323,4 +415,16 @@ output "asset_graveyard_table" {
 
 output "budget_performance_table" {
   value = aws_dynamodb_table.budget_performance.name
+}
+
+output "image_registry_table" {
+  value = aws_dynamodb_table.image_registry.name
+}
+
+output "image_ops_function_arn" {
+  value = aws_lambda_function.image_ops.arn
+}
+
+output "pmax_images_bucket" {
+  value = aws_s3_bucket.pmax_images.id
 }

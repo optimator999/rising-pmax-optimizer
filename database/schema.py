@@ -59,7 +59,18 @@ BUDGET_PERFORMANCE_TABLE = {
     "BillingMode": "PAY_PER_REQUEST",
 }
 
-ALL_TABLES = [ASSET_PERFORMANCE_TABLE, ASSET_GRAVEYARD_TABLE, BUDGET_PERFORMANCE_TABLE]
+IMAGE_REGISTRY_TABLE = {
+    "TableName": "rising_image_registry",
+    "KeySchema": [
+        {"AttributeName": "image_id", "KeyType": "HASH"},
+    ],
+    "AttributeDefinitions": [
+        {"AttributeName": "image_id", "AttributeType": "S"},
+    ],
+    "BillingMode": "PAY_PER_REQUEST",
+}
+
+ALL_TABLES = [ASSET_PERFORMANCE_TABLE, ASSET_GRAVEYARD_TABLE, BUDGET_PERFORMANCE_TABLE, IMAGE_REGISTRY_TABLE]
 
 
 def create_tables(dynamodb_resource=None):

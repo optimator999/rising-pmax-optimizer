@@ -173,6 +173,7 @@ class ShopifyCollector:
         all_orders = []
         search_query = (
             f"created_at:>={start_date} created_at:<={end_date}T23:59:59Z"
+            f' NOT tag:"channel:dealer"'
         )
         cursor = None
 

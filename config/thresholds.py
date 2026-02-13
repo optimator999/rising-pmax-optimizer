@@ -5,10 +5,14 @@ from typing import Dict, Any
 THRESHOLDS: Dict[str, Dict[str, Any]] = {
     "deep_winter": {
         "months": [1, 2],
+        "asset_changes_enabled": False,
         "min_impressions": 150,
         "min_ctr_headline": 2.0,
         "min_ctr_long_headline": 1.0,
         "min_ctr_description": 3.0,
+        "min_ctr_marketing_image": 1.0,
+        "min_ctr_square_marketing_image": 1.0,
+        "min_ctr_portrait_marketing_image": 1.0,
 
         "lookback_days": 60,
         "new_asset_patience_days": 60,
@@ -16,10 +20,14 @@ THRESHOLDS: Dict[str, Dict[str, Any]] = {
     },
     "low_season": {
         "months": [11, 12],
+        "asset_changes_enabled": False,
         "min_impressions": 150,
         "min_ctr_headline": 2.0,
         "min_ctr_long_headline": 1.0,
         "min_ctr_description": 3.0,
+        "min_ctr_marketing_image": 1.0,
+        "min_ctr_square_marketing_image": 1.0,
+        "min_ctr_portrait_marketing_image": 1.0,
 
         "lookback_days": 60,
         "new_asset_patience_days": 60,
@@ -27,10 +35,14 @@ THRESHOLDS: Dict[str, Dict[str, Any]] = {
     },
     "shoulder_season": {
         "months": [3, 4, 9, 10],
-        "min_impressions": 300,
+        "asset_changes_enabled": True,
+        "min_impressions": 500,
         "min_ctr_headline": 3.0,
         "min_ctr_long_headline": 2.0,
         "min_ctr_description": 4.0,
+        "min_ctr_marketing_image": 1.0,
+        "min_ctr_square_marketing_image": 1.0,
+        "min_ctr_portrait_marketing_image": 1.0,
 
         "lookback_days": 30,
         "new_asset_patience_days": 60,
@@ -38,10 +50,14 @@ THRESHOLDS: Dict[str, Dict[str, Any]] = {
     },
     "peak_season": {
         "months": [5, 6, 7, 8],
+        "asset_changes_enabled": True,
         "min_impressions": 500,
         "min_ctr_headline": 4.0,
         "min_ctr_long_headline": 2.5,
         "min_ctr_description": 5.0,
+        "min_ctr_marketing_image": 1.0,
+        "min_ctr_square_marketing_image": 1.0,
+        "min_ctr_portrait_marketing_image": 1.0,
 
         "lookback_days": 30,
         "new_asset_patience_days": 60,
@@ -53,8 +69,8 @@ SEASONAL_BUDGETS: Dict[str, Dict[str, Any]] = {
     "deep_winter": {
         "recommended_daily": 10.0,
         "max_daily": 30.0,
-        "target_roas": 150.0,
-        "notes": "Maintenance mode. Expect near-zero conversions. Focus on brand awareness.",
+        "target_roas": 160.0,
+        "notes": "Maintenance mode. Just above 156% break-even floor.",
     },
     "low_season": {
         "recommended_daily": 30.0,

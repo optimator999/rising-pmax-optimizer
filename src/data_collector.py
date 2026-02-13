@@ -62,11 +62,75 @@ WHERE
   AND asset_group_asset.field_type IN ('HEADLINE', 'DESCRIPTION', 'LONG_HEADLINE')
 """
 
+IMAGE_ASSET_QUERY_TEMPLATE = """
+SELECT
+  asset_group_asset.asset,
+  asset_group_asset.field_type,
+  asset_group_asset.status,
+  asset.name,
+  segments.date,
+  metrics.impressions,
+  metrics.clicks,
+  metrics.conversions,
+  metrics.conversions_value,
+  metrics.cost_micros
+FROM asset_group_asset
+WHERE
+  campaign.id = {campaign_id}
+  AND segments.date >= '{start_date}'
+  AND segments.date <= '{end_date}'
+  AND asset_group_asset.field_type IN ('MARKETING_IMAGE', 'SQUARE_MARKETING_IMAGE', 'PORTRAIT_MARKETING_IMAGE')
+"""
+
+CAMPAIGN_SETTINGS_QUERY = """
+SELECT
+  campaign.id,
+  campaign.name,
+  campaign.status,
+  campaign.bidding_strategy_type,
+  campaign.maximize_conversion_value.target_roas,
+  campaign.maximize_conversions.target_cpa_micros,
+  campaign_budget.amount_micros,
+  campaign.network_settings.target_google_search,
+  campaign.network_settings.target_search_network,
+  campaign.network_settings.target_content_network,
+  campaign.advertising_channel_type
+FROM campaign
+WHERE campaign.id = {campaign_id}
+"""
+
+CAMPAIGN_GEO_TARGETS_QUERY = """
+SELECT
+  campaign_criterion.campaign,
+  campaign_criterion.location.geo_target_constant,
+  campaign_criterion.negative
+FROM campaign_criterion
+WHERE
+  campaign.id = {campaign_id}
+  AND campaign_criterion.type = 'LOCATION'
+"""
+
+CAMPAIGN_AD_SCHEDULE_QUERY = """
+SELECT
+  campaign_criterion.campaign,
+  campaign_criterion.ad_schedule.day_of_week,
+  campaign_criterion.ad_schedule.start_hour,
+  campaign_criterion.ad_schedule.start_minute,
+  campaign_criterion.ad_schedule.end_hour,
+  campaign_criterion.ad_schedule.end_minute
+FROM campaign_criterion
+WHERE
+  campaign.id = {campaign_id}
+  AND campaign_criterion.type = 'AD_SCHEDULE'
+"""
+
 FIELD_TYPE_MAP = {
     "HEADLINE": "HEADLINE",
     "DESCRIPTION": "DESCRIPTION",
     "LONG_HEADLINE": "LONG_HEADLINE",
 }
+
+IMAGE_FIELD_TYPES = {"MARKETING_IMAGE", "SQUARE_MARKETING_IMAGE", "PORTRAIT_MARKETING_IMAGE"}
 
 
 class GoogleAdsCollector:
@@ -266,6 +330,95 @@ class GoogleAdsCollector:
             logger.error("Failed to get campaign budget: %s", e)
         return 0.0
 
+    def get_campaign_settings(self, campaign_id: str) -> Dict[str, Any]:
+        """Query campaign settings, geo targets, and ad schedule from Google Ads.
+
+        Returns a dict matching the google_ads_settings schema.
+        """
+        settings: Dict[str, Any] = {}
+
+        # 1. Campaign settings (bidding, budget, network, dates)
+        try:
+            query = CAMPAIGN_SETTINGS_QUERY.format(campaign_id=campaign_id)
+            results = self._search(query)
+            if results:
+                row = results[0]
+                campaign = row.get("campaign", {})
+                budget = row.get("campaignBudget", {})
+                network = campaign.get("networkSettings", {})
+                mcv = campaign.get("maximizeConversionValue", {})
+                mc = campaign.get("maximizeConversions", {})
+
+                budget_micros = int(budget.get("amountMicros", 0))
+
+                settings["campaign_status"] = campaign.get("status", "")
+                settings["bidding_strategy_type"] = campaign.get("biddingStrategyType", "")
+                settings["target_roas"] = float(mcv.get("targetRoas", 0)) if mcv.get("targetRoas") else None
+                settings["target_cpa_micros"] = int(mc.get("targetCpaMicros", 0)) if mc.get("targetCpaMicros") else None
+                settings["budget_amount_micros"] = budget_micros
+                settings["daily_budget"] = budget_micros / 1_000_000
+                settings["network_settings"] = {
+                    "target_google_search": network.get("targetGoogleSearch", False),
+                    "target_search_network": network.get("targetSearchNetwork", False),
+                    "target_content_network": network.get("targetContentNetwork", False),
+                }
+                settings["advertising_channel_type"] = campaign.get("advertisingChannelType", "")
+
+            time.sleep(1)
+        except Exception as e:
+            logger.error("Failed to get campaign settings for %s: %s", campaign_id, e)
+            raise
+
+        # 2. Geo targets
+        try:
+            query = CAMPAIGN_GEO_TARGETS_QUERY.format(campaign_id=campaign_id)
+            results = self._search(query)
+            geo_targets = []
+            for row in results:
+                criterion = row.get("campaignCriterion", {})
+                location = criterion.get("location", {})
+                geo_targets.append({
+                    "geo_target_constant": location.get("geoTargetConstant", ""),
+                    "negative": criterion.get("negative", False),
+                })
+            settings["geo_targets"] = geo_targets
+            time.sleep(1)
+        except Exception as e:
+            logger.warning("Failed to get geo targets for %s: %s", campaign_id, e)
+            settings["geo_targets"] = []
+
+        # 3. Ad schedule
+        try:
+            query = CAMPAIGN_AD_SCHEDULE_QUERY.format(campaign_id=campaign_id)
+            results = self._search(query)
+            ad_schedule = []
+            for row in results:
+                criterion = row.get("campaignCriterion", {})
+                schedule = criterion.get("adSchedule", {})
+                ad_schedule.append({
+                    "day_of_week": schedule.get("dayOfWeek", ""),
+                    "start_hour": int(schedule.get("startHour", 0)),
+                    "start_minute": schedule.get("startMinute", "ZERO"),
+                    "end_hour": int(schedule.get("endHour", 0)),
+                    "end_minute": schedule.get("endMinute", "ZERO"),
+                })
+            settings["ad_schedule"] = ad_schedule
+            time.sleep(1)
+        except Exception as e:
+            logger.warning("Failed to get ad schedule for %s: %s", campaign_id, e)
+            settings["ad_schedule"] = []
+
+        settings["synced_at"] = datetime.utcnow().isoformat() + "Z"
+
+        logger.info(
+            "Campaign settings for %s: status=%s, bidding=%s, budget=$%.2f",
+            campaign_id,
+            settings.get("campaign_status"),
+            settings.get("bidding_strategy_type"),
+            settings.get("daily_budget", 0),
+        )
+        return settings
+
     def collect_for_campaign(
         self,
         campaign_name: str,
@@ -319,6 +472,134 @@ class GoogleAdsCollector:
 
         logger.info(
             "Aggregated %d unique assets for campaign '%s'",
+            len(result),
+            campaign_name,
+        )
+        return result
+
+    def get_image_asset_performance(
+        self, campaign_id: str, start_date: str, end_date: str
+    ) -> List[Dict[str, Any]]:
+        """Query image asset performance data for a campaign."""
+        query = IMAGE_ASSET_QUERY_TEMPLATE.format(
+            campaign_id=campaign_id,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+        rows = []
+        try:
+            raw_results = self._search(query)
+            for row in raw_results:
+                parsed = self._parse_image_row(row)
+                if parsed:
+                    rows.append(parsed)
+
+            logger.info(
+                "Collected %d image asset-date rows for campaign %s",
+                len(rows),
+                campaign_id,
+            )
+
+        except Exception as e:
+            logger.error("Google Ads API error (images): %s", e)
+            raise
+
+        time.sleep(1)
+        return rows
+
+    def _parse_image_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert a REST API image asset row to a normalized dict."""
+        try:
+            aga = row.get("assetGroupAsset", {})
+            asset = row.get("asset", {})
+            metrics = row.get("metrics", {})
+            segments = row.get("segments", {})
+
+            field_type = aga.get("fieldType", "")
+            if field_type not in IMAGE_FIELD_TYPES:
+                return None
+
+            asset_name = asset.get("name", "")
+            asset_resource = aga.get("asset", "")
+            if not asset_resource:
+                return None
+
+            cost_micros = int(metrics.get("costMicros", 0))
+
+            return {
+                "asset_resource": asset_resource,
+                "asset_name": asset_name,
+                "field_type": field_type,
+                "asset_status": aga.get("status", ""),
+                "date": segments.get("date", ""),
+                "impressions": int(metrics.get("impressions", 0)),
+                "clicks": int(metrics.get("clicks", 0)),
+                "conversions": float(metrics.get("conversions", 0)),
+                "conversions_value": float(metrics.get("conversionsValue", 0)),
+                "cost_micros": cost_micros,
+                "cost": cost_micros / 1_000_000,
+            }
+        except (KeyError, TypeError, ValueError) as e:
+            logger.warning("Failed to parse image row: %s - %s", e, row)
+            return None
+
+    def collect_images_for_campaign(
+        self,
+        campaign_name: str,
+        campaign_id: str,
+        start_date: str,
+        end_date: str,
+    ) -> List[Dict[str, Any]]:
+        """Collect, aggregate, and return image asset data for one campaign."""
+        raw_rows = self.get_image_asset_performance(campaign_id, start_date, end_date)
+
+        aggregated: Dict[str, Dict[str, Any]] = {}
+
+        for row in raw_rows:
+            resource = row["asset_resource"]
+            if resource not in aggregated:
+                aggregated[resource] = {
+                    "asset_id": generate_asset_id(
+                        row.get("asset_name", ""), campaign_name,
+                        asset_resource=resource,
+                    ),
+                    "asset_text": row.get("asset_name", ""),
+                    "asset_name": row.get("asset_name", ""),
+                    "asset_type": row["field_type"],
+                    "asset_resource": resource,
+                    "campaign_name": campaign_name,
+                    "impressions": 0,
+                    "clicks": 0,
+                    "conversions": 0.0,
+                    "conversions_value": 0.0,
+                    "cost": 0.0,
+                    "status": "active",
+                    "dates_seen": [],
+                }
+            agg = aggregated[resource]
+            agg["impressions"] += row["impressions"]
+            agg["clicks"] += row["clicks"]
+            agg["conversions"] += row["conversions"]
+            agg["conversions_value"] += row["conversions_value"]
+            agg["cost"] += row["cost"]
+            agg["dates_seen"].append(row["date"])
+
+        result = []
+        for agg in aggregated.values():
+            impr = agg["impressions"]
+            agg["ctr"] = round((agg["clicks"] / impr * 100) if impr > 0 else 0.0, 2)
+            agg["cpa"] = (
+                round(agg["cost"] / agg["conversions"], 2)
+                if agg["conversions"] > 0
+                else 0.0
+            )
+            agg["date_added"] = min(agg["dates_seen"]) if agg["dates_seen"] else None
+            del agg["dates_seen"]
+            result.append(agg)
+
+        logger.info(
+            "Aggregated %d unique image assets for campaign '%s'",
             len(result),
             campaign_name,
         )

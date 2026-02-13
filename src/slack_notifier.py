@@ -28,8 +28,10 @@ class SlackNotifier:
         flagged_assets: List[Dict[str, Any]],
         replacements: Dict[str, Dict[str, str]],
         csv_files: List[str],
-        budget_data: Optional[Dict[str, Any]] = None,
+        all_budget_data: Optional[Dict[str, Dict[str, Any]]] = None,
         emergency_alerts: Optional[List[Dict[str, Any]]] = None,
+        asset_changes_enabled: bool = True,
+        preview_mode: bool = False,
     ) -> bool:
         """Send the full weekly review as a Slack DM.
 
@@ -37,7 +39,8 @@ class SlackNotifier:
         """
         try:
             message = self._format_review_message(
-                month, flagged_assets, replacements, budget_data, emergency_alerts
+                month, flagged_assets, replacements, all_budget_data,
+                emergency_alerts, asset_changes_enabled, preview_mode,
             )
 
             # Send main message
@@ -121,23 +124,40 @@ class SlackNotifier:
         month: int,
         flagged_assets: List[Dict[str, Any]],
         replacements: Dict[str, Dict[str, str]],
-        budget_data: Optional[Dict[str, Any]] = None,
+        all_budget_data: Optional[Dict[str, Dict[str, Any]]] = None,
         emergency_alerts: Optional[List[Dict[str, Any]]] = None,
+        asset_changes_enabled: bool = True,
+        preview_mode: bool = False,
     ) -> str:
         """Build the full weekly review Slack message."""
         today = format_date(get_today_mountain())
         season = get_season_name(month)
         demand = get_monthly_demand(month)
+        all_budget_data = all_budget_data or {}
+
+        if preview_mode:
+            title = f"🔍 *PREVIEW — Weekly Asset Review - {today}*"
+        elif asset_changes_enabled:
+            title = f"📊 *Weekly Asset Review - {today}*"
+        else:
+            title = f"📊 *Weekly Monitoring Report - {today}*"
 
         lines = [
-            f"📊 *Weekly Asset Review - {today}*",
+            title,
             "",
             f"Season: {season.replace('_', ' ').title()} ({demand}% annual demand)",
         ]
 
-        # Budget section
-        if budget_data:
-            lines.extend(self._format_budget_section(budget_data, season))
+        if preview_mode and not asset_changes_enabled:
+            lines.append("Mode: PREVIEW (off-season — showing what *would* be flagged)")
+        elif not asset_changes_enabled:
+            lines.append("Mode: Monitor Only (no asset changes in off-season)")
+
+        # Per-campaign budget sections
+        for campaign_name, budget_data in all_budget_data.items():
+            lines.extend(
+                self._format_budget_section(budget_data, season, campaign_name)
+            )
 
         # Emergency alerts
         if emergency_alerts:
@@ -148,83 +168,155 @@ class SlackNotifier:
             for alert in emergency_alerts:
                 lines.append(f"*{alert['title']}*: {alert['message']}")
 
-        lines.append("")
-        lines.append("━" * 35)
-        lines.append("🎯 *ASSET PERFORMANCE*")
-        lines.append("━" * 35)
-        lines.append("")
+        # Split flagged assets into text vs image
+        image_types = {"MARKETING_IMAGE", "SQUARE_MARKETING_IMAGE", "PORTRAIT_MARKETING_IMAGE"}
+        text_flagged = [a for a in flagged_assets if a.get("asset_type") not in image_types]
+        image_flagged = [a for a in flagged_assets if a.get("asset_type") in image_types]
 
-        if not flagged_assets:
-            lines.append("No assets flagged for replacement this week.")
-        else:
-            total_cost = sum(float(a.get("cost", 0)) for a in flagged_assets)
-            lines.append(f"*{len(flagged_assets)} assets flagged for replacement*")
-            lines.append(f"Total cost on flagged assets: ${total_cost:.2f}")
+        # Determine whether to show flagged assets
+        show_flags = asset_changes_enabled or preview_mode
+
+        # Asset section - different format for monitor-only seasons
+        if not show_flags:
             lines.append("")
+            lines.append("━" * 35)
+            lines.append("📋 *ASSET STATUS*")
+            lines.append("━" * 35)
+            lines.append("")
+            lines.append("Asset changes paused for off-season.")
+            lines.append("Budget and ROAS monitoring continues.")
+            lines.append("Asset optimization resumes in shoulder season (March).")
+            lines.append("")
+            lines.append("Image monitoring active. No flags in off-season.")
+        else:
+            # Group text flagged assets by campaign
+            campaigns_with_flags = {}
+            for asset in text_flagged:
+                cn = asset.get("campaign_name", "Unknown")
+                campaigns_with_flags.setdefault(cn, []).append(asset)
 
-            for i, asset in enumerate(flagged_assets, 1):
-                asset_id = asset.get("asset_id", "")
-                replacement = replacements.get(asset_id)
+            preview_tag = "PREVIEW " if preview_mode else ""
 
-                lines.append(
-                    f"❌ *ASSET {i}:* {asset.get('asset_text', '')}"
-                )
-                lines.append(
-                    f"Campaign: {asset.get('campaign_name', '')} | "
-                    f"Type: {asset.get('asset_type', '')}"
-                )
-                lines.append(
-                    f"Stats: {asset.get('impressions', 0)} impr | "
-                    f"{asset.get('ctr', 0)}% CTR | "
-                    f"${float(asset.get('cost', 0)):.2f} spent"
-                )
-                lines.append(f"Kill reason: {asset.get('kill_reason', '')}")
-
-                if replacement:
-                    lines.append(f"✅ *REPLACEMENT:* {replacement['text']}")
-                    lines.append(f"Strategy: {replacement.get('strategy', '')}")
-                else:
-                    lines.append("⚠️ No replacement generated (Claude API issue)")
-
+            if not text_flagged:
                 lines.append("")
                 lines.append("━" * 35)
+                lines.append(f"🎯 *{preview_tag}ASSET PERFORMANCE*")
+                lines.append("━" * 35)
+                lines.append("")
+                lines.append("No assets flagged for replacement this week.")
+            else:
+                for campaign_name, campaign_assets in campaigns_with_flags.items():
+                    lines.append("")
+                    lines.append("━" * 35)
+                    lines.append(f"🎯 *{preview_tag}ASSET PERFORMANCE — {campaign_name}*")
+                    lines.append("━" * 35)
+                    if preview_mode:
+                        lines.append("_No action taken — preview only_")
+                    lines.append("")
+
+                    total_cost = sum(float(a.get("cost", 0)) for a in campaign_assets)
+                    lines.append(f"*{len(campaign_assets)} assets would be flagged for replacement*"
+                                 if preview_mode else
+                                 f"*{len(campaign_assets)} assets flagged for replacement*")
+                    lines.append(f"Total cost on flagged assets: ${total_cost:,.2f}")
+                    lines.append("")
+
+                    for i, asset in enumerate(campaign_assets, 1):
+                        asset_id = asset.get("asset_id", "")
+                        replacement = replacements.get(asset_id)
+
+                        lines.append(
+                            f"❌ *ASSET {i}:* {asset.get('asset_text', '')}"
+                        )
+                        lines.append(
+                            f"Type: {asset.get('asset_type', '')}"
+                        )
+                        lines.append(
+                            f"Stats: {asset.get('impressions', 0)} impr | "
+                            f"{asset.get('ctr', 0)}% CTR | "
+                            f"${float(asset.get('cost', 0)):,.2f} spent"
+                        )
+                        lines.append(f"Kill reason: {asset.get('kill_reason', '')}")
+
+                        if preview_mode:
+                            lines.append("ℹ️ Preview — no replacement generated")
+                        elif replacement:
+                            lines.append(f"✅ *REPLACEMENT:* {replacement['text']}")
+                            lines.append(f"Strategy: {replacement.get('strategy', '')}")
+                        else:
+                            lines.append("⚠️ No replacement generated (Claude API issue)")
+
+                        lines.append("")
+
+                if not preview_mode:
+                    lines.append("━" * 35)
+                    lines.append("")
+                    lines.append(f"📎 CSV file(s) attached below.")
+                    lines.append("Import into Google Ads Editor to apply changes.")
+                    lines.append("Review within 3 days for tracking.")
+
+            # Image performance section (per campaign)
+            image_by_campaign = {}
+            for asset in image_flagged:
+                cn = asset.get("campaign_name", "Unknown")
+                image_by_campaign.setdefault(cn, []).append(asset)
+
+            for campaign_name, campaign_images in image_by_campaign.items():
+                lines.append("")
+                lines.append("━" * 35)
+                lines.append(f"🖼️ *{preview_tag}IMAGE PERFORMANCE — {campaign_name}*")
+                lines.append("━" * 35)
+                if preview_mode:
+                    lines.append("_No action taken — preview only_")
+                lines.append("")
+                lines.append(f"{len(campaign_images)} images below CTR threshold")
                 lines.append("")
 
-            lines.append(f"📎 CSV file(s) attached below.")
-            lines.append("Import into Google Ads Editor to apply changes.")
-            lines.append("Review within 3 days for tracking.")
+                for i, asset in enumerate(campaign_images, 1):
+                    lines.append(
+                        f"❌ *IMAGE {i}:* {asset.get('asset_text', asset.get('asset_name', ''))}"
+                    )
+                    lines.append(f"   Type: {asset.get('asset_type', '')}")
+                    lines.append(
+                        f"   Stats: {asset.get('impressions', 0):,} impr | "
+                        f"{asset.get('ctr', 0)}% CTR | "
+                        f"${float(asset.get('cost', 0)):,.2f} spent"
+                    )
+                    lines.append("   Action: Replace in Google Ads > Assets")
+                    lines.append("")
 
         return "\n".join(lines)
 
     def _format_budget_section(
-        self, budget_data: Dict[str, Any], season: str
+        self, budget_data: Dict[str, Any], season: str, campaign_name: str = ""
     ) -> List[str]:
         """Format the budget performance section of the message."""
         lookback_start = budget_data.get("lookback_start", "")
         lookback_end = budget_data.get("lookback_end", "")
         lookback_days = budget_data.get("lookback_days", "")
 
+        header = f"💰 *BUDGET — {campaign_name}*" if campaign_name else "💰 *BUDGET PERFORMANCE*"
         lines = [
             "",
             "━" * 35,
-            "💰 *BUDGET PERFORMANCE*",
+            header,
             "━" * 35,
             "",
             f"Period: {lookback_start} to {lookback_end} ({lookback_days} days)",
             "",
-            f"Current budget: ${float(budget_data.get('daily_budget_target', 0)):.0f}/day",
-            f"Actual spend: ${float(budget_data.get('actual_daily_spend_avg', 0)):.2f}/day "
+            f"Current budget: ${float(budget_data.get('daily_budget_target', 0)):,.0f}/day",
+            f"Actual spend: ${float(budget_data.get('actual_daily_spend_avg', 0)):,.2f}/day "
             f"({float(budget_data.get('budget_utilization_percent', 0)):.1f}% utilization)",
-            f"Total spend: ${float(budget_data.get('total_spend', 0)):.2f}",
+            f"Total spend: ${float(budget_data.get('total_spend', 0)):,.2f}",
             f"Campaign CTR: {float(budget_data.get('campaign_ctr', 0)):.2f}% "
             f"({budget_data.get('campaign_clicks', 0):,} clicks / "
             f"{budget_data.get('campaign_impressions', 0):,} impr)",
-            f"Revenue (Shopify): ${float(budget_data.get('total_revenue', 0)):.2f}",
+            f"Revenue (Shopify): ${float(budget_data.get('total_revenue', 0)):,.2f}",
             f"Shopify orders (Google-attributed): {budget_data.get('shopify_orders', 0)}",
             f"Google share of Shopify revenue: {float(budget_data.get('shopify_google_share_pct', 0)):.1f}%",
-            f"ROAS (Shopify): {float(budget_data.get('roas_percent', 0)):.0f}%",
+            f"ROAS (Shopify): {float(budget_data.get('roas_percent', 0)):,.0f}%",
             "",
-            f"Target ROAS: {float(budget_data.get('target_roas_percent', 0)):.0f}%",
+            f"Target ROAS: {float(budget_data.get('target_roas_percent', 0)):,.0f}%",
         ]
 
         rec = budget_data.get("recommendation", "hold").upper()
@@ -235,7 +327,7 @@ class SlackNotifier:
         lines.append(f"📈 *RECOMMENDATION: {rec}*")
         lines.append(reason)
         if rec_budget and rec != "HOLD":
-            lines.append(f"Recommended budget: ${float(rec_budget):.0f}/day")
+            lines.append(f"Recommended budget: ${float(rec_budget):,.0f}/day")
 
         return lines
 

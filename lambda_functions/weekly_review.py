@@ -23,7 +23,8 @@ import os
 # Add project root to path for Lambda packaging
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config.settings import CAMPAIGNS, logger
+from config.settings import CAMPAIGNS as FALLBACK_CAMPAIGNS, logger
+from src.campaign_config import load_campaigns_with_fallback
 from config.thresholds import get_season_name, get_seasonal_budget, get_thresholds
 from database.queries import (
     get_budget_history,
@@ -59,6 +60,11 @@ def lambda_handler(event, context):
     slack_notifier = None
 
     try:
+        # Check for preview mode (run analysis even in off-season, no side effects)
+        preview_mode = event.get("preview_mode", False)
+        if preview_mode:
+            logger.info("PREVIEW MODE: Will flag assets but skip graveyard/replacements/CSV")
+
         # Step 1: Load credentials
         logger.info("Step 1: Loading credentials")
         google_creds = get_google_ads_credentials()
@@ -79,11 +85,18 @@ def lambda_handler(event, context):
         seasonal_budget = get_seasonal_budget(month)
         today = get_today_mountain()
 
-        logger.info("Season: %s, Month: %d", season, month)
+        asset_changes_enabled = thresholds.get("asset_changes_enabled", True)
+        logger.info(
+            "Season: %s, Month: %d, asset_changes: %s",
+            season, month, asset_changes_enabled,
+        )
 
         # Step 3: Collect data from Google Ads
         logger.info("Step 3: Collecting Google Ads data")
         collector = GoogleAdsCollector(google_creds)
+
+        # Load campaigns from S3 config (auto-syncs if stale, falls back to settings.py)
+        CAMPAIGNS = load_campaigns_with_fallback(collector)
 
         all_flagged = []
         all_replacements = {}
@@ -104,7 +117,7 @@ def lambda_handler(event, context):
             lookback = thresholds["lookback_days"]
             lookback_start = get_lookback_date(lookback)
 
-            # Collect asset performance
+            # Collect text asset performance
             assets = collector.collect_for_campaign(
                 campaign_name=campaign_name,
                 campaign_id=campaign_id,
@@ -112,32 +125,64 @@ def lambda_handler(event, context):
                 end_date=today,
             )
 
+            # Collect image asset performance
+            image_assets = collector.collect_images_for_campaign(
+                campaign_name=campaign_name,
+                campaign_id=campaign_id,
+                start_date=lookback_start,
+                end_date=today,
+            )
+
             # Step 4: Save raw data to DynamoDB
-            logger.info("Step 4: Saving %d assets to DynamoDB", len(assets))
+            logger.info("Step 4: Saving %d text + %d image assets to DynamoDB", len(assets), len(image_assets))
             for asset in assets:
                 asset["report_date"] = today
                 save_asset_performance(asset)
+            for img_asset in image_assets:
+                img_asset["report_date"] = today
+                save_asset_performance(img_asset)
 
-            # Step 5: Analyze and flag underperformers
-            logger.info("Step 5: Analyzing assets")
-            graveyard = get_graveyard_assets(campaign_name)
-            analyzer = AssetAnalyzer(month=month)
-            flagged = analyzer.flag_underperformers(assets, graveyard)
-            all_flagged.extend(flagged)
-
-            # Step 6: Generate replacement copy
-            logger.info("Step 6: Generating replacements for %d assets", len(flagged))
+            # Step 5 & 6: Analyze and flag underperformers, generate replacements
+            # Run in active seasons, or in preview mode (any season)
             replacements = {}
+            flagged = []
+            flagged_images = []
             claude_error = None
-            if flagged:
-                try:
-                    generator = CopyGenerator(api_key=anthropic_key)
-                    replacements = generator.generate_replacements(flagged, graveyard)
-                except Exception as e:
-                    claude_error = str(e)
-                    logger.error("Claude API failed: %s", e, exc_info=True)
-                    # Graceful degradation: continue without replacements
-            all_replacements.update(replacements)
+            if asset_changes_enabled or preview_mode:
+                mode_label = "PREVIEW " if preview_mode and not asset_changes_enabled else ""
+                logger.info("Step 5: %sAnalyzing assets", mode_label)
+                graveyard = get_graveyard_assets(campaign_name)
+                analyzer = AssetAnalyzer(month=month)
+                flagged = analyzer.flag_underperformers(assets, graveyard)
+                all_flagged.extend(flagged)
+
+                # Flag underperforming images (no replacement generation)
+                flagged_images = analyzer.flag_underperformers(image_assets, graveyard)
+                all_flagged.extend(flagged_images)
+                logger.info(
+                    "%sFlagged %d text + %d image assets for campaign '%s'",
+                    mode_label, len(flagged), len(flagged_images), campaign_name,
+                )
+
+                # Skip replacements in preview mode
+                if asset_changes_enabled and not preview_mode:
+                    logger.info("Step 6: Generating replacements for %d text assets", len(flagged))
+                    if flagged:
+                        try:
+                            generator = CopyGenerator(api_key=anthropic_key)
+                            replacements = generator.generate_replacements(flagged, graveyard)
+                        except Exception as e:
+                            claude_error = str(e)
+                            logger.error("Claude API failed: %s", e, exc_info=True)
+                    all_replacements.update(replacements)
+                else:
+                    logger.info("Step 6: Skipping replacements (%s)",
+                                "preview mode" if preview_mode else "off-season")
+            else:
+                logger.info(
+                    "Steps 5-6: Skipping asset flagging/replacement (%s is monitor-only)",
+                    season,
+                )
 
             # Step 7: Calculate budget performance (Shopify ROAS)
             logger.info("Step 7: Calculating budget performance with Shopify revenue")
@@ -226,26 +271,32 @@ def lambda_handler(event, context):
             )
             all_emergency_alerts.extend(emergencies)
 
-            # Save flagged assets to graveyard
-            for asset in flagged:
-                asset["date_killed"] = today
-                save_to_graveyard(asset)
+            # Step 9: Save flagged assets to graveyard and build CSV
+            # Skip in preview mode (no permanent side effects)
+            if asset_changes_enabled and not preview_mode:
+                for asset in flagged:
+                    asset["date_killed"] = today
+                    save_to_graveyard(asset)
+                for img_asset in flagged_images:
+                    img_asset["date_killed"] = today
+                    save_to_graveyard(img_asset)
 
-            # Step 9: Build CSV
-            logger.info("Step 9: Building CSV")
-            if flagged:
-                csv_builder = CSVBuilder()
-                rows = csv_builder.build_google_ads_csv(
-                    flagged_assets=flagged,
-                    replacements=replacements,
-                    campaign_name=campaign_name,
-                    asset_group=campaign_config["asset_group"],
-                )
-                csv_path = csv_builder.save_csv(
-                    rows=rows,
-                    campaign_slug=campaign_config["slug"],
-                )
-                all_csv_files.append(csv_path)
+                logger.info("Step 9: Building CSV (text assets only)")
+                if flagged:
+                    csv_builder = CSVBuilder()
+                    rows = csv_builder.build_google_ads_csv(
+                        flagged_assets=flagged,
+                        replacements=replacements,
+                        campaign_name=campaign_name,
+                        asset_group=campaign_config["asset_group"],
+                    )
+                    csv_path = csv_builder.save_csv(
+                        rows=rows,
+                        campaign_slug=campaign_config["slug"],
+                    )
+                    all_csv_files.append(csv_path)
+            elif preview_mode:
+                logger.info("Step 9: Skipping graveyard/CSV (preview mode)")
 
         # Step 10: Send Slack notification
         logger.info("Step 10: Sending Slack notification")
@@ -254,17 +305,16 @@ def lambda_handler(event, context):
         if all_emergency_alerts:
             slack_notifier.send_emergency_alerts(all_emergency_alerts)
 
-        # Send the weekly review
-        # Use budget data from first campaign for the main message
-        primary_budget = next(iter(all_budget_data.values()), None)
-
+        # Send the weekly review with per-campaign budget data
         slack_notifier.send_review(
             month=month,
             flagged_assets=all_flagged,
             replacements=all_replacements,
             csv_files=all_csv_files,
-            budget_data=primary_budget,
+            all_budget_data=all_budget_data,
             emergency_alerts=all_emergency_alerts,
+            asset_changes_enabled=asset_changes_enabled,
+            preview_mode=preview_mode,
         )
 
         result = {
@@ -285,6 +335,7 @@ def lambda_handler(event, context):
                     for k, v in all_budget_data.items()
                 },
                 "claude_error": claude_error,
+                "preview_mode": preview_mode,
             },
         }
 

@@ -84,6 +84,9 @@ class AssetAnalyzer:
             "HEADLINE": "min_ctr_headline",
             "LONG_HEADLINE": "min_ctr_long_headline",
             "DESCRIPTION": "min_ctr_description",
+            "MARKETING_IMAGE": "min_ctr_marketing_image",
+            "SQUARE_MARKETING_IMAGE": "min_ctr_square_marketing_image",
+            "PORTRAIT_MARKETING_IMAGE": "min_ctr_portrait_marketing_image",
         }.get(asset_type)
 
         if ctr_key:
@@ -107,8 +110,17 @@ class AssetAnalyzer:
         - specificity: Too vague or generic
         - length: Poor use of character limit
         """
-        text = asset.get("asset_text", "").lower()
         asset_type = asset.get("asset_type", "")
+
+        # Image assets: skip text-based analysis
+        if asset_type in (
+            "MARKETING_IMAGE",
+            "SQUARE_MARKETING_IMAGE",
+            "PORTRAIT_MARKETING_IMAGE",
+        ):
+            return "visual_fatigue: Image underperforming. Consider replacing with fresh creative."
+
+        text = asset.get("asset_text", "").lower()
 
         # Check for voice violations (hype language)
         for pattern in KNOWN_FAILURE_PATTERNS:

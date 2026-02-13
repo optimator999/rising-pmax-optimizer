@@ -18,7 +18,8 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config.settings import CAMPAIGNS, logger
+from config.settings import CAMPAIGNS as FALLBACK_CAMPAIGNS, logger
+from src.campaign_config import load_campaigns_with_fallback
 from config.thresholds import get_thresholds
 from database.queries import get_latest_asset_records
 from src.data_collector import GoogleAdsCollector
@@ -47,6 +48,9 @@ def lambda_handler(event, context):
         collector = GoogleAdsCollector(google_creds)
         month = get_current_month()
         thresholds = get_thresholds(month)
+
+        # Load campaigns from S3 config (auto-syncs if stale, falls back to settings.py)
+        CAMPAIGNS = load_campaigns_with_fallback(collector)
 
         verification_reports = []
 

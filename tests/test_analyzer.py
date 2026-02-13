@@ -134,6 +134,11 @@ class TestAnalyzerJanuary:
         assert thresholds["min_ctr_headline"] == 2.0
         assert "max_cost_zero_conv" not in thresholds
 
+    def test_asset_changes_disabled_in_winter(self):
+        """Deep winter should be monitor-only (no asset changes)."""
+        thresholds = self.analyzer.thresholds
+        assert thresholds["asset_changes_enabled"] is False
+
     def test_flags_worst_performers(self):
         """Even with relaxed thresholds, worst offenders get flagged."""
         flagged = self.analyzer.flag_underperformers(self.assets)
@@ -150,6 +155,34 @@ class TestAnalyzerJanuary:
         assert total_conv == 0.0
 
 
+class TestAnalyzerLowSeason:
+    """Test analyzer with low season (Nov-Dec) - monitor only."""
+
+    def setup_method(self):
+        self.analyzer = AssetAnalyzer(month=11)
+
+    def test_asset_changes_disabled_in_low_season(self):
+        """Low season should be monitor-only (no asset changes)."""
+        thresholds = self.analyzer.thresholds
+        assert thresholds["asset_changes_enabled"] is False
+
+
+class TestAnalyzerShoulderSeason:
+    """Test analyzer with shoulder season thresholds."""
+
+    def setup_method(self):
+        self.analyzer = AssetAnalyzer(month=3)
+
+    def test_season_detected_correctly(self):
+        assert self.analyzer.season == "shoulder_season"
+
+    def test_asset_changes_enabled_in_shoulder(self):
+        """Shoulder season should have asset changes enabled."""
+        thresholds = self.analyzer.thresholds
+        assert thresholds["asset_changes_enabled"] is True
+        assert thresholds["min_impressions"] == 500
+
+
 class TestAnalyzerPeakSeason:
     """Test analyzer with peak season thresholds."""
 
@@ -164,6 +197,11 @@ class TestAnalyzerPeakSeason:
         assert thresholds["min_impressions"] == 500
         assert thresholds["min_ctr_headline"] == 4.0
         assert thresholds["min_ctr_description"] == 5.0
+
+    def test_asset_changes_enabled_in_peak(self):
+        """Peak season should have asset changes enabled."""
+        thresholds = self.analyzer.thresholds
+        assert thresholds["asset_changes_enabled"] is True
 
 
 class TestNewAssetProtection:
@@ -303,6 +341,130 @@ class TestBudgetRecommendation:
             season="deep_winter",
         )
         assert result["recommended_budget"] >= 10.0
+
+
+class TestImageAssetFlagging:
+    """Test image asset flagging and diagnosis."""
+
+    def test_image_below_ctr_threshold_is_flagged(self):
+        """Image with CTR below 1.0% should be flagged."""
+        analyzer = AssetAnalyzer(month=6)  # peak season
+        asset = {
+            "asset_text": "lifestyle-river-shot-03",
+            "asset_type": "MARKETING_IMAGE",
+            "impressions": 1240,
+            "clicks": 9,
+            "ctr": 0.73,
+            "conversions": 0,
+            "cost": 12.50,
+            "status": "active",
+            "date_added": "2025-01-01",
+        }
+        reason = analyzer.should_kill(asset)
+        assert reason is not None
+        assert "CTR" in reason
+        assert "MARKETING_IMAGE" in reason
+
+    def test_image_above_ctr_threshold_not_flagged(self):
+        """Image with CTR above 1.0% should NOT be flagged."""
+        analyzer = AssetAnalyzer(month=6)
+        asset = {
+            "asset_text": "product-net-walnut-01",
+            "asset_type": "MARKETING_IMAGE",
+            "impressions": 2100,
+            "clicks": 67,
+            "ctr": 3.19,
+            "conversions": 2,
+            "cost": 25.00,
+            "status": "active",
+            "date_added": "2025-01-01",
+        }
+        reason = analyzer.should_kill(asset)
+        assert reason is None
+
+    def test_image_diagnosis_returns_visual_fatigue(self):
+        """Image diagnosis should return visual_fatigue message."""
+        analyzer = AssetAnalyzer(month=6)
+        asset = {
+            "asset_text": "lifestyle-river-shot-03",
+            "asset_type": "MARKETING_IMAGE",
+            "ctr": 0.73,
+        }
+        diagnosis = analyzer.diagnose_failure(asset, [])
+        assert "visual_fatigue" in diagnosis
+        assert "fresh creative" in diagnosis.lower()
+
+    def test_square_image_diagnosis_returns_visual_fatigue(self):
+        """Square image diagnosis should also return visual_fatigue."""
+        analyzer = AssetAnalyzer(month=6)
+        asset = {
+            "asset_text": "square-product-01",
+            "asset_type": "SQUARE_MARKETING_IMAGE",
+            "ctr": 0.50,
+        }
+        diagnosis = analyzer.diagnose_failure(asset, [])
+        assert "visual_fatigue" in diagnosis
+
+    def test_portrait_image_diagnosis_returns_visual_fatigue(self):
+        """Portrait image diagnosis should also return visual_fatigue."""
+        analyzer = AssetAnalyzer(month=6)
+        asset = {
+            "asset_text": "portrait-lifestyle-01",
+            "asset_type": "PORTRAIT_MARKETING_IMAGE",
+            "ctr": 0.40,
+        }
+        diagnosis = analyzer.diagnose_failure(asset, [])
+        assert "visual_fatigue" in diagnosis
+
+    def test_image_thresholds_present_in_all_seasons(self):
+        """All seasons should have image CTR thresholds."""
+        from config.thresholds import THRESHOLDS
+
+        for season_name, config in THRESHOLDS.items():
+            assert "min_ctr_marketing_image" in config, (
+                f"Missing min_ctr_marketing_image in {season_name}"
+            )
+            assert "min_ctr_square_marketing_image" in config, (
+                f"Missing min_ctr_square_marketing_image in {season_name}"
+            )
+            assert "min_ctr_portrait_marketing_image" in config, (
+                f"Missing min_ctr_portrait_marketing_image in {season_name}"
+            )
+            assert config["min_ctr_marketing_image"] == 1.0
+            assert config["min_ctr_square_marketing_image"] == 1.0
+            assert config["min_ctr_portrait_marketing_image"] == 1.0
+
+    def test_image_flagged_via_flag_underperformers(self):
+        """Image assets should flow through flag_underperformers correctly."""
+        analyzer = AssetAnalyzer(month=6)
+        assets = [
+            {
+                "asset_text": "low-ctr-image",
+                "asset_type": "MARKETING_IMAGE",
+                "impressions": 1000,
+                "clicks": 5,
+                "ctr": 0.5,
+                "conversions": 0,
+                "cost": 10.00,
+                "status": "active",
+                "date_added": "2025-01-01",
+            },
+            {
+                "asset_text": "high-ctr-image",
+                "asset_type": "SQUARE_MARKETING_IMAGE",
+                "impressions": 1000,
+                "clicks": 30,
+                "ctr": 3.0,
+                "conversions": 1,
+                "cost": 15.00,
+                "status": "active",
+                "date_added": "2025-01-01",
+            },
+        ]
+        flagged = analyzer.flag_underperformers(assets)
+        assert len(flagged) == 1
+        assert flagged[0]["asset_text"] == "low-ctr-image"
+        assert "visual_fatigue" in flagged[0]["diagnosis"]
 
 
 if __name__ == "__main__":

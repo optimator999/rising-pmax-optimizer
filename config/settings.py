@@ -47,12 +47,34 @@ def get_parameter(name: str, encrypted: bool = True) -> str:
     return response["Parameter"]["Value"]
 
 
+# S3 bucket for image assets
+S3_IMAGE_BUCKET = os.getenv("S3_IMAGE_BUCKET", "rising-pmax")
+
 # Campaign configuration
 CAMPAIGNS = {
     "Core Brand": {
         "campaign_id": "22483972722",
         "asset_group": "Core Brand",
         "slug": "core_brand",
+        "image_profile": {
+            "product_hero": 0.20,
+            "product_in_use": 0.30,
+            "lifestyle_with_product": 0.30,
+            "lifestyle_no_product": 0.10,
+            "product_detail": 0.10,
+        },
+    },
+    "Replacement Nets": {
+        "campaign_id": "22494027316",
+        "asset_group": "Replacement Nets",
+        "slug": "replacement_nets",
+        "image_profile": {
+            "product_hero": 0.25,
+            "product_detail": 0.30,
+            "product_in_use": 0.25,
+            "lifestyle_with_product": 0.15,
+            "lifestyle_no_product": 0.05,
+        },
     },
 }
 

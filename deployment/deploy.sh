@@ -38,6 +38,16 @@ zip -r packages/verify_upload.zip \
   utils/ \
   -x "*__pycache__*" "*.pyc"
 
+# Package image_ops
+zip -r packages/image_ops.zip \
+  lambda_functions/image_ops.py \
+  lambda_functions/__init__.py \
+  src/ \
+  config/ \
+  database/ \
+  utils/ \
+  -x "*__pycache__*" "*.pyc"
+
 echo "Packages built:"
 ls -lh packages/
 echo ""

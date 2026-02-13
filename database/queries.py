@@ -17,9 +17,14 @@ def _get_table(table_name: str):
     return get_dynamodb_resource().Table(table_name)
 
 
-def generate_asset_id(asset_text: str, campaign_name: str) -> str:
-    """Generate deterministic asset ID from text + campaign."""
-    raw = f"{asset_text}|{campaign_name}"
+def generate_asset_id(asset_text: str, campaign_name: str, asset_resource: Optional[str] = None) -> str:
+    """Generate deterministic asset ID from text + campaign.
+
+    For image assets, use asset_resource (the Google Ads resource name) as
+    the stable identifier instead of asset_text.
+    """
+    key = asset_resource if asset_resource else asset_text
+    raw = f"{key}|{campaign_name}"
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
@@ -261,3 +266,146 @@ def get_budget_history(
         Limit=weeks,
     )
     return response.get("Items", [])
+
+
+# --- Image Registry ---
+
+
+def save_image(image: Dict[str, Any]) -> None:
+    """Save or update an image registry entry."""
+    table = _get_table("rising_image_registry")
+    now = datetime.utcnow().isoformat() + "Z"
+
+    item = {
+        "image_id": image["image_id"],
+        "s3_key": image["s3_key"],
+        "image_hash": image.get("image_hash"),
+        "filename_original": image.get("filename_original"),
+        "source": image.get("source", "manual_upload"),
+        "native_aspect_ratio": image.get("native_aspect_ratio"),
+        "width_px": image.get("width_px"),
+        "height_px": image.get("height_px"),
+        "file_size_bytes": image.get("file_size_bytes"),
+        # AI metadata
+        "content_category": image.get("content_category"),
+        "product_visible": image.get("product_visible"),
+        "human_present": image.get("human_present"),
+        "scene_type": image.get("scene_type"),
+        "background_complexity": image.get("background_complexity"),
+        "text_overlay": image.get("text_overlay"),
+        "product_frame_ratio": image.get("product_frame_ratio"),
+        "lighting": image.get("lighting"),
+        "seasonal_relevance": image.get("seasonal_relevance"),
+        "ai_description": image.get("ai_description"),
+        "ai_analysis_model": image.get("ai_analysis_model"),
+        "ai_analyzed_at": image.get("ai_analyzed_at"),
+        # Campaign fit (populated when analyzed with campaign context)
+        "campaign_fit_score": image.get("campaign_fit_score"),
+        "campaign_fit_notes": image.get("campaign_fit_notes"),
+        # Crop eligibility
+        "eligible_slots": image.get("eligible_slots"),
+        # Google Ads mapping
+        "google_ads_assets": image.get("google_ads_assets", []),
+        # Performance
+        "performance_by_campaign": image.get("performance_by_campaign", {}),
+        "overall_ctr": image.get("overall_ctr"),
+        # Lifecycle
+        "status": image.get("status", "available"),
+        "related_images": image.get("related_images", []),
+        "updated_at": now,
+    }
+
+    if "created_at" not in image:
+        item["created_at"] = now
+
+    # Convert floats to Decimal for DynamoDB
+    item = _convert_for_dynamodb(item)
+    # Remove None values
+    item = {k: v for k, v in item.items() if v is not None}
+
+    table.put_item(Item=item)
+    logger.debug("Saved image %s to registry", image["image_id"])
+
+
+def get_image(image_id: str) -> Optional[Dict[str, Any]]:
+    """Get a single image from the registry."""
+    table = _get_table("rising_image_registry")
+    response = table.get_item(Key={"image_id": image_id})
+    return response.get("Item")
+
+
+def get_all_images() -> List[Dict[str, Any]]:
+    """Get all images from the registry."""
+    table = _get_table("rising_image_registry")
+    response = table.scan()
+    items = response.get("Items", [])
+
+    while "LastEvaluatedKey" in response:
+        response = table.scan(
+            ExclusiveStartKey=response["LastEvaluatedKey"],
+        )
+        items.extend(response.get("Items", []))
+
+    return items
+
+
+def get_images_for_campaign(campaign_name: str) -> List[Dict[str, Any]]:
+    """Get all images currently linked to a campaign (date_unlinked is null)."""
+    all_images = get_all_images()
+    result = []
+    for image in all_images:
+        for mapping in image.get("google_ads_assets", []):
+            if (
+                mapping.get("campaign_name") == campaign_name
+                and not mapping.get("date_unlinked")
+            ):
+                result.append(image)
+                break
+    return result
+
+
+def lookup_image_by_asset_resource(asset_resource: str) -> Optional[Dict[str, Any]]:
+    """Find an image by its Google Ads asset resource name."""
+    all_images = get_all_images()
+    for image in all_images:
+        for mapping in image.get("google_ads_assets", []):
+            if mapping.get("asset_resource") == asset_resource:
+                return image
+    return None
+
+
+def update_image_performance(
+    image_id: str,
+    campaign_name: str,
+    metrics: Dict[str, Any],
+) -> None:
+    """Update performance data for an image in a specific campaign."""
+    table = _get_table("rising_image_registry")
+    now = datetime.utcnow().isoformat() + "Z"
+
+    perf = {
+        "impressions": Decimal(str(metrics.get("impressions", 0))),
+        "clicks": Decimal(str(metrics.get("clicks", 0))),
+        "ctr": Decimal(str(metrics.get("ctr", 0.0))),
+        "cost": Decimal(str(metrics.get("cost", 0.0))),
+        "last_updated": now,
+    }
+
+    table.update_item(
+        Key={"image_id": image_id},
+        UpdateExpression="SET performance_by_campaign.#cn = :perf, updated_at = :now",
+        ExpressionAttributeNames={"#cn": campaign_name},
+        ExpressionAttributeValues={":perf": perf, ":now": now},
+    )
+    logger.debug("Updated performance for image %s in %s", image_id, campaign_name)
+
+
+def _convert_for_dynamodb(obj: Any) -> Any:
+    """Recursively convert floats to Decimal for DynamoDB."""
+    if isinstance(obj, float):
+        return Decimal(str(obj))
+    if isinstance(obj, dict):
+        return {k: _convert_for_dynamodb(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_convert_for_dynamodb(i) for i in obj]
+    return obj
