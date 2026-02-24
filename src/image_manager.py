@@ -5,7 +5,6 @@ gap analysis, and bootstrapping from Google Ads.
 """
 
 import hashlib
-import io
 import json
 import logging
 import uuid
@@ -39,19 +38,32 @@ IMAGE_FIELD_TYPES = {
     "PORTRAIT_MARKETING_IMAGE",
 }
 
+
+
+ASSET_GROUP_QUERY = """
+SELECT
+  asset_group.id,
+  asset_group.name,
+  asset_group.resource_name,
+  asset_group.status
+FROM asset_group
+WHERE campaign.resource_name = '{campaign_resource}'
+"""
+
 IMAGE_ASSET_QUERY = """
 SELECT
   asset_group_asset.asset,
   asset_group_asset.field_type,
-  asset_group_asset.status,
+  asset.id,
   asset.name,
   asset.image_asset.full_size.url,
   asset.image_asset.full_size.width_pixels,
   asset.image_asset.full_size.height_pixels,
   asset.image_asset.file_size
 FROM asset_group_asset
-WHERE
-  campaign.id = {campaign_id}
+WHERE asset_group.resource_name = '{asset_group_resource}'
+  AND asset.type = 'IMAGE'
+  AND asset_group_asset.status = 'ENABLED'
   AND asset_group_asset.field_type IN (
     'MARKETING_IMAGE', 'SQUARE_MARKETING_IMAGE', 'PORTRAIT_MARKETING_IMAGE'
   )
@@ -83,11 +95,12 @@ The product is a handcrafted fly fishing landing net made from wood.
 If a net-shaped object is visible, product_visible is true.
 
 For content_category, follow this priority:
-1. Product is main subject on simple background -> product_hero
-2. Close-up of materials/craftsmanship -> product_detail
-3. Person actively using the product -> product_in_use
-4. Product visible in a broader scene -> lifestyle_with_product
-5. No product visible -> lifestyle_no_product
+1. Image shows specs, dimensions, color swatches, feature callouts, or text overlays describing the product -> product_detail
+2. Close-up of materials, craftsmanship, or construction details -> product_detail
+3. Product is main subject on simple background with no text or specs -> product_hero
+4. Person actively using the product -> product_in_use
+5. Product visible in a broader scene -> lifestyle_with_product
+6. No product visible -> lifestyle_no_product
 
 For crop_eligibility, assess whether the image can be cropped to each aspect ratio
 (landscape 1.91:1, square 1:1, portrait 4:5) while keeping the main subject
@@ -337,6 +350,9 @@ class ImageManager:
     def bootstrap_from_google_ads(self, campaigns: Optional[List[str]] = None) -> Dict[str, Any]:
         """Pull all image assets from Google Ads, analyze, and register.
 
+        Queries by asset group (not campaign) with status=ENABLED so each
+        source image is returned once, not once per format crop.
+
         Returns summary of bootstrap results.
         """
         if not self.collector:
@@ -354,27 +370,58 @@ class ImageManager:
             campaign_id = config["campaign_id"]
             logger.info("Bootstrapping images for campaign: %s", campaign_name)
 
-            query = IMAGE_ASSET_QUERY.format(campaign_id=campaign_id)
             campaign_results = {"new": 0, "duplicate": 0, "errors": 0}
 
             try:
-                raw_rows = self.collector._search(query)
-                logger.info("Found %d image assets in %s", len(raw_rows), campaign_name)
+                # Step 1: Get enabled asset groups for this campaign
+                customer_id = self.collector.client_customer_id
+                campaign_resource = f"customers/{customer_id}/campaigns/{campaign_id}"
+                ag_rows = self.collector._search(
+                    ASSET_GROUP_QUERY.format(campaign_resource=campaign_resource)
+                )
+                enabled_groups = [
+                    r for r in ag_rows
+                    if r.get("assetGroup", {}).get("status") == "ENABLED"
+                ]
+                logger.info(
+                    "Found %d enabled asset groups for %s",
+                    len(enabled_groups), campaign_name,
+                )
 
-                for row in raw_rows:
-                    results["total"] += 1
-                    try:
-                        entry = self._process_bootstrap_row(row, campaign_name, config["asset_group"])
-                        if entry.get("_was_duplicate"):
-                            campaign_results["duplicate"] += 1
-                            results["duplicate"] += 1
-                        else:
-                            campaign_results["new"] += 1
-                            results["new"] += 1
-                    except Exception as e:
-                        logger.error("Failed to process image asset: %s", e)
-                        campaign_results["errors"] += 1
-                        results["errors"] += 1
+                # Step 2: For each enabled asset group, get ENABLED images
+                live_asset_resources = set()
+                for ag in enabled_groups:
+                    ag_resource = ag["assetGroup"]["resourceName"]
+                    ag_name = ag["assetGroup"]["name"]
+                    raw_rows = self.collector._search(
+                        IMAGE_ASSET_QUERY.format(asset_group_resource=ag_resource)
+                    )
+                    logger.info(
+                        "Found %d ENABLED image assets in asset group '%s'",
+                        len(raw_rows), ag_name,
+                    )
+
+                    for row in raw_rows:
+                        results["total"] += 1
+                        asset_resource = row.get("assetGroupAsset", {}).get("asset", "")
+                        if asset_resource:
+                            live_asset_resources.add(asset_resource)
+                        try:
+                            entry = self._process_bootstrap_row(row, campaign_name, ag_name)
+                            if entry.get("_was_duplicate"):
+                                campaign_results["duplicate"] += 1
+                                results["duplicate"] += 1
+                            else:
+                                campaign_results["new"] += 1
+                                results["new"] += 1
+                        except Exception as e:
+                            logger.error("Failed to process image asset: %s", e)
+                            campaign_results["errors"] += 1
+                            results["errors"] += 1
+
+                # Reconcile: unlink images no longer in Google Ads
+                unlinked = self._reconcile_campaign_mappings(campaign_name, live_asset_resources)
+                campaign_results["unlinked"] = unlinked
 
             except Exception as e:
                 logger.error("Failed to query images for %s: %s", campaign_name, e)
@@ -447,6 +494,7 @@ class ImageManager:
             "asset_group": asset_group,
             "field_type": field_type,
             "asset_name": asset_name,
+            "image_url": image_url,
         }
 
         if existing:
@@ -715,6 +763,38 @@ class ImageManager:
                 return image
         return None
 
+    def _reconcile_campaign_mappings(self, campaign_name: str, live_asset_resources: set) -> int:
+        """Unlink registry mappings no longer present in Google Ads.
+
+        Compares the set of asset_resources currently live in Google Ads
+        against the registry. Any mapping for this campaign whose
+        asset_resource is not in the live set gets date_unlinked stamped.
+
+        Returns the number of mappings unlinked.
+        """
+        images = get_images_for_campaign(campaign_name)
+        unlinked_count = 0
+        now = datetime.utcnow().isoformat() + "Z"
+
+        for image in images:
+            updated = False
+            for mapping in image.get("google_ads_assets", []):
+                if (
+                    mapping.get("campaign_name") == campaign_name
+                    and not mapping.get("date_unlinked")
+                    and mapping.get("asset_resource") not in live_asset_resources
+                ):
+                    mapping["date_unlinked"] = now
+                    updated = True
+                    unlinked_count += 1
+
+            if updated:
+                save_image(image)
+
+        if unlinked_count:
+            logger.info("Unlinked %d stale mappings for %s", unlinked_count, campaign_name)
+        return unlinked_count
+
     def _add_google_ads_mapping(
         self, image: Dict[str, Any], mapping: Dict[str, str]
     ) -> None:
@@ -727,7 +807,6 @@ class ImageManager:
         # Check if this asset_resource is already mapped
         for m in existing_mappings:
             if m.get("asset_resource") == mapping.get("asset_resource"):
-                logger.debug("Mapping already exists for %s", mapping.get("asset_resource"))
                 return
 
         existing_mappings.append(mapping)

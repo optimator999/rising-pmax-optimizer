@@ -103,6 +103,7 @@ def lambda_handler(event, context):
         all_csv_files = []
         all_budget_data = {}
         all_emergency_alerts = []
+        all_sitelinks = {}
 
         for campaign_name, campaign_config in CAMPAIGNS.items():
             campaign_id = campaign_config.get("campaign_id")
@@ -113,6 +114,13 @@ def lambda_handler(event, context):
                 continue
 
             logger.info("Processing campaign: %s", campaign_name)
+
+            # Skip paused campaigns
+            settings = collector.get_campaign_settings(campaign_id)
+            status = settings.get("campaign_status", "")
+            if status == "PAUSED":
+                logger.info("Campaign '%s' is PAUSED, skipping", campaign_name)
+                continue
 
             lookback = thresholds["lookback_days"]
             lookback_start = get_lookback_date(lookback)
@@ -132,6 +140,11 @@ def lambda_handler(event, context):
                 start_date=lookback_start,
                 end_date=today,
             )
+
+            # Separate sitelinks from text assets (different query level)
+            sitelinks = [a for a in assets if a.get("asset_type") == "SITELINK"]
+            assets = [a for a in assets if a.get("asset_type") != "SITELINK"]
+            all_sitelinks[campaign_name] = sitelinks
 
             # Step 4: Save raw data to DynamoDB
             logger.info("Step 4: Saving %d text + %d image assets to DynamoDB", len(assets), len(image_assets))
@@ -225,6 +238,30 @@ def lambda_handler(event, context):
 
             roas = (total_revenue / total_spend * 100) if total_spend > 0 else 0
 
+            # 7-day and 14-day ROAS
+            roas_7d = 0
+            roas_14d = 0
+            start_7d = get_lookback_date(7)
+            start_14d = get_lookback_date(14)
+
+            metrics_7d = collector.get_campaign_metrics(
+                campaign_id, start_date=start_7d, end_date=today
+            )
+            revenue_7d = shopify.get_google_attributed_revenue(
+                start_date=start_7d, end_date=today, campaign_name=campaign_name,
+            )
+            if metrics_7d["total_spend"] > 0:
+                roas_7d = revenue_7d["total_revenue"] / metrics_7d["total_spend"] * 100
+
+            metrics_14d = collector.get_campaign_metrics(
+                campaign_id, start_date=start_14d, end_date=today
+            )
+            revenue_14d = shopify.get_google_attributed_revenue(
+                start_date=start_14d, end_date=today, campaign_name=campaign_name,
+            )
+            if metrics_14d["total_spend"] > 0:
+                roas_14d = revenue_14d["total_revenue"] / metrics_14d["total_spend"] * 100
+
             budget_rec = calculate_budget_recommendation(
                 current_daily_budget=daily_budget_target,
                 actual_daily_spend_avg=actual_daily_avg,
@@ -251,6 +288,8 @@ def lambda_handler(event, context):
                 "shopify_orders": shopify_orders,
                 "shopify_google_share_pct": shopify_revenue.get("google_share_pct", 0),
                 "roas_percent": round(roas, 1),
+                "roas_7d_percent": round(roas_7d, 1),
+                "roas_14d_percent": round(roas_14d, 1),
                 "roas_source": "shopify",
                 "target_roas_percent": target_roas,
                 "budget_utilization_percent": round(utilization, 1),
@@ -315,6 +354,7 @@ def lambda_handler(event, context):
             emergency_alerts=all_emergency_alerts,
             asset_changes_enabled=asset_changes_enabled,
             preview_mode=preview_mode,
+            all_sitelinks=all_sitelinks,
         )
 
         result = {

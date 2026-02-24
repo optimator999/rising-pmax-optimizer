@@ -1,6 +1,6 @@
 """Lambda handler for image asset operations.
 
-Supports actions: bootstrap, upload, gap_analysis, analyze.
+Supports actions: bootstrap, upload, gap_analysis, analyze, sync_config, audit.
 Invoked manually or via future automation triggers.
 """
 
@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.settings import CAMPAIGNS, logger
 from src.campaign_config import load_config, save_config, sync_google_ads_settings, get_campaigns_dict
 from src.image_manager import ImageManager
-from utils.aws_helpers import get_anthropic_api_key, get_google_ads_credentials
+from utils.aws_helpers import get_anthropic_api_key, get_google_ads_credentials, get_slack_credentials
 
 
 def lambda_handler(event, context):
@@ -33,12 +33,14 @@ def lambda_handler(event, context):
             return _handle_analyze(event)
         elif action == "sync_config":
             return _handle_sync_config(event)
+        elif action == "audit":
+            return _handle_audit(event)
         else:
             return {
                 "statusCode": 400,
                 "body": {
                     "error": f"Unknown action: {action}",
-                    "valid_actions": ["bootstrap", "upload", "gap_analysis", "analyze", "sync_config"],
+                    "valid_actions": ["bootstrap", "upload", "gap_analysis", "analyze", "sync_config", "audit"],
                 },
             }
 
@@ -132,8 +134,9 @@ def _handle_upload(event):
 
 
 def _handle_gap_analysis(event):
-    """Run composition gap analysis for one or more campaigns."""
+    """Run composition gap analysis for one or more campaigns and post to Slack."""
     campaigns = event.get("campaigns", list(CAMPAIGNS.keys()))
+    post_to_slack = event.get("post_to_slack", True)
     anthropic_key = get_anthropic_api_key()
 
     # Load full S3 config for campaign strategy context
@@ -147,21 +150,46 @@ def _handle_gap_analysis(event):
     )
 
     results = {}
+    formatted_messages = []
     for campaign_name in campaigns:
         analysis = manager.gap_analysis(campaign_name)
+        formatted = manager.format_gap_analysis(analysis)
         results[campaign_name] = {
             "total_images": analysis["total_images"],
             "recommendations": analysis["recommendations"],
             "smart_recs": analysis.get("smart_recs", False),
             "composition": analysis["composition"],
-            "formatted": manager.format_gap_analysis(analysis),
+            "formatted": formatted,
         }
+        formatted_messages.append(formatted)
+
+    # Post to Slack
+    slack_sent = False
+    if post_to_slack and formatted_messages:
+        try:
+            from src.slack_notifier import SlackNotifier
+            slack_creds = get_slack_credentials()
+            notifier = SlackNotifier(
+                bot_token=slack_creds["token"],
+                user_id=slack_creds["channel"],
+            )
+            message = "\n\n".join(formatted_messages)
+            notifier.client.chat_postMessage(
+                channel=notifier.user_id,
+                text=message,
+                mrkdwn=True,
+            )
+            slack_sent = True
+            logger.info("Gap analysis posted to Slack")
+        except Exception as e:
+            logger.error("Failed to post gap analysis to Slack: %s", e)
 
     return {
         "statusCode": 200,
         "body": {
             "action": "gap_analysis",
             "results": results,
+            "slack_sent": slack_sent,
         },
     }
 
@@ -274,5 +302,64 @@ def _handle_analyze(event):
             "ai_description": image["ai_description"],
             "campaign_fit_score": image.get("campaign_fit_score"),
             "campaign_fit_notes": image.get("campaign_fit_notes"),
+        },
+    }
+
+
+def _handle_audit(event):
+    """Run campaign health audit and optionally post results to Slack."""
+    campaigns_filter = event.get("campaigns")
+    post_to_slack = event.get("post_to_slack", True)
+
+    anthropic_key = get_anthropic_api_key()
+    campaign_config = load_config()
+
+    from src.campaign_auditor import CampaignAuditor
+
+    auditor = CampaignAuditor(campaign_config, anthropic_api_key=anthropic_key)
+
+    if campaigns_filter:
+        # Audit specific campaigns
+        campaign_results = {}
+        all_findings = []
+        for campaign_name in campaigns_filter:
+            result = auditor.audit_campaign(campaign_name)
+            campaign_results[campaign_name] = result
+            all_findings.extend(result["findings"])
+
+        summary_data = auditor._generate_summary(all_findings, campaign_results)
+        results = {
+            "campaigns": campaign_results,
+            "summary": summary_data.get("summary", ""),
+            "recommendations": summary_data.get("recommendations", []),
+            "season": auditor.season,
+            "month": auditor.month,
+        }
+    else:
+        results = auditor.audit_all()
+
+    # Post to Slack
+    slack_sent = False
+    if post_to_slack:
+        try:
+            from src.slack_notifier import SlackNotifier
+
+            slack_creds = get_slack_credentials()
+            notifier = SlackNotifier(
+                bot_token=slack_creds["token"],
+                user_id=slack_creds["channel"],
+            )
+            report_text = auditor.format_audit_report(results)
+            slack_sent = notifier.send_audit_report(report_text)
+            logger.info("Audit report posted to Slack")
+        except Exception as e:
+            logger.error("Failed to post audit to Slack: %s", e)
+
+    return {
+        "statusCode": 200,
+        "body": {
+            "action": "audit",
+            "results": results,
+            "slack_sent": slack_sent,
         },
     }

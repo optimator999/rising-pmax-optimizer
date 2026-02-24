@@ -261,10 +261,11 @@ resource "aws_iam_role_policy" "lambda_policy" {
 # ---------- Lambda Layer ----------
 
 resource "aws_lambda_layer_version" "dependencies" {
-  filename            = "${path.module}/../../lambda_layer.zip"
+  s3_bucket           = aws_s3_bucket.pmax_images.id
+  s3_key              = "deployments/lambda_layer.zip"
   layer_name          = "rising-pmax-dependencies"
   compatible_runtimes = ["python3.12"]
-  description         = "Dependencies for Rising PMax Optimizer"
+  description         = "Dependencies for Rising PMax Optimizer (with Pillow)"
 }
 
 # ---------- Lambda Functions ----------
@@ -393,6 +394,56 @@ resource "aws_lambda_permission" "verify_upload_eventbridge" {
   function_name = aws_lambda_function.verify_upload.function_name
   principal     = "events.amazonaws.com"
   source_arn    = aws_cloudwatch_event_rule.verify_upload.arn
+}
+
+resource "aws_cloudwatch_event_rule" "sync_config" {
+  name                = "rising-sync-config-trigger"
+  description         = "Sync Google Ads settings daily at 6am MT (1pm UTC)"
+  schedule_expression = "cron(0 13 ? * * *)"
+
+  tags = {
+    Project     = "rising-pmax"
+    Environment = var.environment
+  }
+}
+
+resource "aws_cloudwatch_event_target" "sync_config" {
+  rule  = aws_cloudwatch_event_rule.sync_config.name
+  arn   = aws_lambda_function.image_ops.arn
+  input = jsonencode({ action = "sync_config" })
+}
+
+resource "aws_lambda_permission" "sync_config_eventbridge" {
+  statement_id  = "AllowEventBridgeSyncConfig"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.image_ops.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.sync_config.arn
+}
+
+resource "aws_cloudwatch_event_rule" "audit" {
+  name                = "rising-audit-trigger"
+  description         = "Run campaign health audit every Monday at 6am MT (1pm UTC)"
+  schedule_expression = "cron(0 13 ? * MON *)"
+
+  tags = {
+    Project     = "rising-pmax"
+    Environment = var.environment
+  }
+}
+
+resource "aws_cloudwatch_event_target" "audit" {
+  rule  = aws_cloudwatch_event_rule.audit.name
+  arn   = aws_lambda_function.image_ops.arn
+  input = jsonencode({ action = "audit" })
+}
+
+resource "aws_lambda_permission" "audit_eventbridge" {
+  statement_id  = "AllowEventBridgeAudit"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.image_ops.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.audit.arn
 }
 
 # ---------- Outputs ----------

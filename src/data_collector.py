@@ -62,6 +62,28 @@ WHERE
   AND asset_group_asset.field_type IN ('HEADLINE', 'DESCRIPTION', 'LONG_HEADLINE')
 """
 
+SITELINK_QUERY_TEMPLATE = """
+SELECT
+  campaign.id,
+  campaign_asset.asset,
+  campaign_asset.field_type,
+  campaign_asset.status,
+  asset.sitelink_asset.link_text,
+  asset.sitelink_asset.description1,
+  asset.sitelink_asset.description2,
+  asset.final_urls,
+  metrics.impressions,
+  metrics.clicks,
+  metrics.conversions,
+  metrics.conversions_value,
+  metrics.cost_micros
+FROM campaign_asset
+WHERE
+  campaign.id = {campaign_id}
+  AND campaign_asset.field_type = 'SITELINK'
+  AND campaign_asset.status = 'ENABLED'
+"""
+
 IMAGE_ASSET_QUERY_TEMPLATE = """
 SELECT
   asset_group_asset.asset,
@@ -236,6 +258,54 @@ class GoogleAdsCollector:
         time.sleep(1)
         return rows
 
+    def get_sitelinks(self, campaign_id: str) -> List[Dict[str, Any]]:
+        """Query sitelinks for a campaign.
+
+        Sitelinks are campaign-level assets (not asset-group-level).
+        Metrics are lifetime totals (date segmentation not supported).
+        """
+        query = SITELINK_QUERY_TEMPLATE.format(campaign_id=campaign_id)
+
+        sitelinks = []
+        try:
+            raw_results = self._search(query)
+            for row in raw_results:
+                asset = row.get("asset", {})
+                ca = row.get("campaignAsset", {})
+                sl = asset.get("sitelinkAsset", {})
+                metrics = row.get("metrics", {})
+                link_text = sl.get("linkText", "")
+                if not link_text:
+                    continue
+                cost_micros = int(metrics.get("costMicros", 0))
+                impressions = int(metrics.get("impressions", 0))
+                clicks = int(metrics.get("clicks", 0))
+                sitelinks.append({
+                    "asset_resource": ca.get("asset", ""),
+                    "field_type": "SITELINK",
+                    "asset_status": ca.get("status", ""),
+                    "asset_text": link_text,
+                    "sitelink_description1": sl.get("description1", ""),
+                    "sitelink_description2": sl.get("description2", ""),
+                    "final_urls": asset.get("finalUrls", []),
+                    "impressions": impressions,
+                    "clicks": clicks,
+                    "ctr": round((clicks / impressions * 100) if impressions > 0 else 0.0, 2),
+                    "conversions": float(metrics.get("conversions", 0)),
+                    "conversions_value": float(metrics.get("conversionsValue", 0)),
+                    "cost_micros": cost_micros,
+                    "cost": cost_micros / 1_000_000,
+                })
+
+            logger.info(
+                "Collected %d sitelinks for campaign %s", len(sitelinks), campaign_id
+            )
+        except Exception as e:
+            logger.error("Failed to get sitelinks for campaign %s: %s", campaign_id, e)
+
+        time.sleep(1)
+        return sitelinks
+
     def _parse_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
         """Convert a REST API response row to a normalized dict."""
         try:
@@ -247,9 +317,7 @@ class GoogleAdsCollector:
             field_type = aga.get("fieldType", "")
             field_type = FIELD_TYPE_MAP.get(field_type, field_type)
 
-            # Skip non-text asset types
-            text_asset = asset.get("textAsset", {})
-            asset_text = text_asset.get("text", "")
+            asset_text = asset.get("textAsset", {}).get("text", "")
             if not asset_text:
                 return None
 
@@ -470,9 +538,32 @@ class GoogleAdsCollector:
             del agg["dates_seen"]
             result.append(agg)
 
+        # Add sitelinks (campaign-level, lifetime metrics only)
+        sitelinks = self.get_sitelinks(campaign_id)
+        for sl in sitelinks:
+            result.append({
+                "asset_id": generate_asset_id(sl["asset_text"], campaign_name),
+                "asset_text": sl["asset_text"],
+                "asset_type": "SITELINK",
+                "campaign_name": campaign_name,
+                "impressions": sl["impressions"],
+                "clicks": sl["clicks"],
+                "conversions": sl["conversions"],
+                "conversions_value": sl["conversions_value"],
+                "cost": sl["cost"],
+                "status": "active",
+                "ctr": sl["ctr"],
+                "cpa": round(sl["cost"] / sl["conversions"], 2) if sl["conversions"] > 0 else 0.0,
+                "date_added": None,
+                "sitelink_description1": sl.get("sitelink_description1", ""),
+                "sitelink_description2": sl.get("sitelink_description2", ""),
+                "final_urls": sl.get("final_urls", []),
+            })
+
         logger.info(
-            "Aggregated %d unique assets for campaign '%s'",
+            "Aggregated %d unique assets (%d sitelinks) for campaign '%s'",
             len(result),
+            len(sitelinks),
             campaign_name,
         )
         return result

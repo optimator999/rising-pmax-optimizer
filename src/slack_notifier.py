@@ -32,6 +32,7 @@ class SlackNotifier:
         emergency_alerts: Optional[List[Dict[str, Any]]] = None,
         asset_changes_enabled: bool = True,
         preview_mode: bool = False,
+        all_sitelinks: Optional[Dict[str, List[Dict[str, Any]]]] = None,
     ) -> bool:
         """Send the full weekly review as a Slack DM.
 
@@ -41,6 +42,7 @@ class SlackNotifier:
             message = self._format_review_message(
                 month, flagged_assets, replacements, all_budget_data,
                 emergency_alerts, asset_changes_enabled, preview_mode,
+                all_sitelinks,
             )
 
             # Send main message
@@ -89,6 +91,26 @@ class SlackNotifier:
             logger.error("Failed to send error to Slack: %s", e)
             return False
 
+    def send_audit_report(self, report_text: str) -> bool:
+        """Send campaign health audit report as Slack DM.
+
+        Returns True on success, False on failure.
+        """
+        try:
+            self.client.chat_postMessage(
+                channel=self.user_id,
+                text=report_text,
+                mrkdwn=True,
+            )
+            logger.info("Audit report sent to Slack")
+            return True
+        except SlackApiError as e:
+            logger.error("Slack API error sending audit: %s", e.response["error"])
+            return False
+        except Exception as e:
+            logger.error("Failed to send audit report: %s", e)
+            return False
+
     def send_emergency_alerts(self, alerts: List[Dict[str, Any]]) -> bool:
         """Send emergency alert messages."""
         for alert in alerts:
@@ -128,6 +150,7 @@ class SlackNotifier:
         emergency_alerts: Optional[List[Dict[str, Any]]] = None,
         asset_changes_enabled: bool = True,
         preview_mode: bool = False,
+        all_sitelinks: Optional[Dict[str, List[Dict[str, Any]]]] = None,
     ) -> str:
         """Build the full weekly review Slack message."""
         today = format_date(get_today_mountain())
@@ -158,6 +181,14 @@ class SlackNotifier:
             lines.extend(
                 self._format_budget_section(budget_data, season, campaign_name)
             )
+
+        # Sitelink performance sections
+        all_sitelinks = all_sitelinks or {}
+        for campaign_name, sitelinks in all_sitelinks.items():
+            if sitelinks:
+                lines.extend(
+                    self._format_sitelink_section(sitelinks, campaign_name)
+                )
 
         # Emergency alerts
         if emergency_alerts:
@@ -315,6 +346,8 @@ class SlackNotifier:
             f"Shopify orders (Google-attributed): {budget_data.get('shopify_orders', 0)}",
             f"Google share of Shopify revenue: {float(budget_data.get('shopify_google_share_pct', 0)):.1f}%",
             f"ROAS (Shopify): {float(budget_data.get('roas_percent', 0)):,.0f}%",
+            f"  7-day ROAS: {float(budget_data.get('roas_7d_percent', 0)):,.0f}%"
+            f"  |  14-day ROAS: {float(budget_data.get('roas_14d_percent', 0)):,.0f}%",
             "",
             f"Target ROAS: {float(budget_data.get('target_roas_percent', 0)):,.0f}%",
         ]
@@ -328,6 +361,37 @@ class SlackNotifier:
         lines.append(reason)
         if rec_budget and rec != "HOLD":
             lines.append(f"Recommended budget: ${float(rec_budget):,.0f}/day")
+
+        return lines
+
+    def _format_sitelink_section(
+        self, sitelinks: List[Dict[str, Any]], campaign_name: str
+    ) -> List[str]:
+        """Format the sitelink performance section of the message."""
+        lines = [
+            "",
+            "━" * 35,
+            f"🔗 *SITELINKS — {campaign_name}*",
+            "━" * 35,
+            "_Lifetime metrics (not date-segmented)_",
+            "",
+        ]
+
+        # Sort by clicks descending
+        sorted_sitelinks = sorted(sitelinks, key=lambda s: s.get("clicks", 0), reverse=True)
+
+        for sl in sorted_sitelinks:
+            clicks = sl.get("clicks", 0)
+            impressions = sl.get("impressions", 0)
+            ctr = sl.get("ctr", 0)
+            cost = float(sl.get("cost", 0))
+            conversions = sl.get("conversions", 0)
+
+            lines.append(f"*{sl['asset_text']}*")
+            lines.append(
+                f"  {impressions:,} impr | {clicks:,} clicks | "
+                f"{ctr:.1f}% CTR | ${cost:,.2f} spent | {conversions:.0f} conv"
+            )
 
         return lines
 
